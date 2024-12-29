@@ -1,20 +1,25 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image/png"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alecthomas/kong"
+	"github.com/crazy3lf/colorconv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/semaphore"
@@ -189,6 +194,7 @@ func multiconnect(ctx context.Context, connCh chan connResponse, connSem *semaph
 						ch <- connResponse{nil, err}
 						return
 					} else {
+						sem.Release(1)
 						continue
 					}
 				}
@@ -223,20 +229,58 @@ func multiconnect(ctx context.Context, connCh chan connResponse, connSem *semaph
 	}
 }
 
-func min3(a, b, c float64) float64 {
-	return math.Min(math.Min(a, b), c)
+func render(pixBuf *[][]byte, xoff, yoff, width, height, numClients uint, hoff float64) {
+	h := 0.0
+	increment := (2.0 * math.Pi) / float64(width)
+	off := (hoff * 2.0 * math.Pi)
+	var x, y uint
+	var segment uint
+	for segment = 0; segment < uint(numClients); segment++ {
+		var sb strings.Builder
+		for x = segment * (width / numClients); x < ((segment + 1) * (width / numClients)); x++ {
+			for y = 0; y < height; y++ {
+				sinVal := (increment * float64(x)) + off
+				h = (180.0 * math.Sin(sinVal)) + 180.0
+				r, g, b, _ := colorconv.HSVToRGB(h, 1.0, 1.0)
+				fmt.Fprintf(&sb, "PX %d %d %02x%02x%02x\n", x+xoff, y+yoff, r, g, b)
+			}
+		}
+		(*pixBuf)[segment] = []byte(sb.String())
+	}
 }
 
-func hueToRGB(h float64) (int, int, int) {
-	kr := math.Mod(5+h*6, 6)
-	kg := math.Mod(3+h*6, 6)
-	kb := math.Mod(1+h*6, 6)
+func renderLab(pixBuf *[][]byte, img []byte, iw, ih, xoff, yoff, width, height, numClients uint, hoff float64) {
+	//h := 0.0
+	//increment := (2.0 * math.Pi) / float64(width)
+	//off := (hoff * 2.0 * math.Pi)
+	//var x, y uint
+	var segment uint
+	for segment = 0; segment < uint(numClients); segment++ {
+		var sb strings.Builder
+		/*for x = segment * (width / numClients); x < ((segment + 1) * (width / numClients)); x++ {
+			for y = 0; y < height; y++ {
+				sinVal := (increment * float64(x)) + off
+				h = (180.0 * math.Sin(sinVal)) + 180.0
+				r, g, b, _ := colorconv.HSVToRGB(h, 1.0, 1.0)
+				fmt.Fprintf(&sb, "PX %d %d %02x%02x%02x\n", x+xoff, y+yoff, r, g, b)
+			}
+		}*/
+		segw := width / 2
+		segx := xoff + segw*segment
+		for i := 0; i < 16; i++ {
+			fmt.Fprintf(&sb, "OFFSET %d %d\n", int(segx+(uint(rand.Uint32())%(width-iw))), int(yoff+(uint(rand.Uint32())%(height-ih))))
 
-	r := 1 - math.Max(min3(kr, 4-kr, 1), 0)
-	g := 1 - math.Max(min3(kg, 4-kg, 1), 0)
-	b := 1 - math.Max(min3(kb, 4-kb, 1), 0)
-
-	return int(math.Round(r * 255.0)), int(math.Round(g * 255.0)), int(math.Round(b * 255.0))
+			for ix := 0; ix < int(iw); ix++ {
+				for iy := 0; iy < int(ih); iy++ {
+					a := img[iy*int(iw)+ix]
+					if a > 0 {
+						fmt.Fprintf(&sb, "PX %d %d FF\n", ix, iy)
+					}
+				}
+			}
+		}
+		(*pixBuf)[segment] = []byte(sb.String())
+	}
 }
 
 func shoot(server string, port int16, xoff, yoff, width, height, threads, maxConns uint) {
@@ -244,21 +288,52 @@ func shoot(server string, port int16, xoff, yoff, width, height, threads, maxCon
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	defer cancelFunc()
 
-	pixbufs := make([][2][]byte, maxConns)
-	for connBufNum := 0; connBufNum < int(maxConns); connBufNum++ {
-		var r, g, b int
-		h := 0.0
-		var pixbuf []byte
-		for x := xoff; x < (xoff + width); x++ {
-			for y := yoff; y < (yoff + height); y++ {
-				h = (1.0 / float64(width)) * float64(x)
-				r, g, b = hueToRGB(h)
-				pixbuf = append(pixbuf, ([]byte(fmt.Sprintf("PX %d %d %02x%02x%02x\n", x, y, r, g, b)))...)
+	var writerBufIdx int32
+	atomic.StoreInt32(&writerBufIdx, 0)
+
+	pixBufs := make([][][]byte, 2)
+	go func(bufs [][][]byte, bufIdx *int32) {
+		imgFile, err := os.ReadFile("lab.png")
+		if err != nil {
+			log.Err(err)
+		}
+		img, err := png.Decode(bytes.NewReader(imgFile))
+		if err != nil {
+			log.Err(err)
+		}
+
+		imax := img.Bounds().Max
+		imgBuf := make([]byte, imax.X*imax.Y)
+		for x := 0; x < imax.X; x++ {
+			for y := 0; y < imax.Y; y++ {
+				_, _, _, a := img.At(x, y).RGBA()
+				var b byte
+				if a > 0 {
+					b = 255
+				}
+				imgBuf[y*int(imax.X)+x] = b
 			}
 		}
-		log.Info().Uint("num", uint(connBufNum)).Int("sz", len(pixbuf)).Msg("prepared buffer")
-		pixbufs[connBufNum][0] = pixbuf
-	}
+
+		pixBuf := make([][]byte, maxConns)
+		hoff := 0.0
+		renderLab(&pixBuf, imgBuf, uint(imax.X), uint(imax.Y), xoff, yoff, width, height, maxConns, hoff)
+		bufs[atomic.LoadInt32(bufIdx)] = pixBuf
+		log.Info().Int("sz", len(bufs[0][0])).Msg("prepared buffer")
+
+		for {
+			_idx := atomic.LoadInt32(bufIdx)
+			atomic.StoreInt32(bufIdx, _idx^1)
+			pixBuf = make([][]byte, maxConns)
+			renderLab(&pixBuf, imgBuf, uint(imax.X), uint(imax.Y), xoff, yoff, width, height, maxConns, hoff)
+			bufs[_idx] = pixBuf
+			time.Sleep(time.Millisecond * 32)
+			hoff += 0.005
+			hoff = math.Mod(hoff, 1.0)
+		}
+	}(pixBufs, &writerBufIdx)
+
+	time.Sleep(time.Second)
 
 	// use a semaphore to track connection count
 	sem := semaphore.NewWeighted(int64(maxConns))
@@ -278,7 +353,7 @@ func shoot(server string, port int16, xoff, yoff, width, height, threads, maxCon
 			}
 
 			// launch writer thread
-			go func(conn net.Conn, pixbuf [2][]byte, writerNum, xoff, yoff, width, height uint) {
+			go func(conn net.Conn, pixbuf [][][]byte, bufIdx *int32, writerNum uint) {
 				defer sem.Release(1)
 
 				// todo: the first thread that runs should query this once
@@ -290,17 +365,14 @@ func shoot(server string, port int16, xoff, yoff, width, height, threads, maxCon
 					}
 					log.Info().Int("x", maxx).Int("y", maxy).Msg("canvas size")
 				*/
-
-				log.Info().Uint("num", writerNum).Uint("x", xoff).Uint("y", yoff).Uint("w", width).Uint("h", height).Msg("blasting rect")
 				for {
-					conn.Write(pixbuf[0])
-					_, err := conn.Write(pixbuf[0])
+					_, err := conn.Write(pixbuf[atomic.LoadInt32(bufIdx)][writerNum])
 					if err != nil {
 						log.Err(err)
 						return
 					}
 				}
-			}(response.conn, pixbufs[writerNum], writerNum, xoff+((width/maxConns)*writerNum), yoff, width/maxConns, height)
+			}(response.conn, pixBufs, &writerBufIdx, writerNum)
 			writerNum++
 			writerNum = writerNum % maxConns
 		}
