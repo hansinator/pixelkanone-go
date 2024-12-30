@@ -8,7 +8,6 @@ import (
 	"image/png"
 	"io"
 	"math"
-	"math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -199,6 +198,12 @@ func multiconnect(ctx context.Context, connCh chan connResponse, connSem *semaph
 					}
 				}
 
+				if err := conn.(*net.TCPConn).SetNoDelay(true); err != nil {
+					ch <- connResponse{nil, err}
+					conn.Close()
+					return
+				}
+
 				select {
 				case <-cancelCtx.Done():
 					return
@@ -250,31 +255,29 @@ func render(pixBuf *[][]byte, xoff, yoff, width, height, numClients uint, hoff f
 }
 
 func renderLab(pixBuf *[][]byte, img []byte, iw, ih, xoff, yoff, width, height, numClients uint, hoff float64) {
-	//h := 0.0
-	//increment := (2.0 * math.Pi) / float64(width)
-	//off := (hoff * 2.0 * math.Pi)
+	h := 0.0
+	increment := (2.0 * math.Pi) / float64(width/10)
+	off := (hoff * 2.0 * math.Pi)
 	//var x, y uint
 	var segment uint
 	for segment = 0; segment < uint(numClients); segment++ {
 		var sb strings.Builder
-		/*for x = segment * (width / numClients); x < ((segment + 1) * (width / numClients)); x++ {
-			for y = 0; y < height; y++ {
-				sinVal := (increment * float64(x)) + off
-				h = (180.0 * math.Sin(sinVal)) + 180.0
-				r, g, b, _ := colorconv.HSVToRGB(h, 1.0, 1.0)
-				fmt.Fprintf(&sb, "PX %d %d %02x%02x%02x\n", x+xoff, y+yoff, r, g, b)
-			}
-		}*/
 		segw := width / 2
 		segx := xoff + segw*segment
-		for i := 0; i < 16; i++ {
-			fmt.Fprintf(&sb, "OFFSET %d %d\n", int(segx+(uint(rand.Uint32())%(width-iw))), int(yoff+(uint(rand.Uint32())%(height-ih))))
+		for i := 0; i < 5; i++ {
+			//fmt.Fprintf(&sb, "OFFSET %d %d\n", int(segx+(uint(rand.Uint32())%(width-iw))), int(yoff+(uint(rand.Uint32())%(height-ih))))
+			fmt.Fprintf(&sb, "OFFSET %d %d\n", int(segx)+(int(iw)*i), int(yoff))
 
 			for ix := 0; ix < int(iw); ix++ {
 				for iy := 0; iy < int(ih); iy++ {
 					a := img[iy*int(iw)+ix]
 					if a > 0 {
-						fmt.Fprintf(&sb, "PX %d %d FF\n", ix, iy)
+						sinVal := (increment * float64(int(segx)+ix+(int(iw)*i))) + off
+						h = (180.0 * math.Sin(sinVal)) + 180.0
+						r, g, b, _ := colorconv.HSVToRGB(h, 1.0, 1.0)
+						fmt.Fprintf(&sb, "PX %d %d %02x%02x%02x\n", ix, iy, r, g, b)
+					} else {
+						fmt.Fprintf(&sb, "PX %d %d 00\n", ix, iy)
 					}
 				}
 			}
@@ -327,8 +330,8 @@ func shoot(server string, port int16, xoff, yoff, width, height, threads, maxCon
 			pixBuf = make([][]byte, maxConns)
 			renderLab(&pixBuf, imgBuf, uint(imax.X), uint(imax.Y), xoff, yoff, width, height, maxConns, hoff)
 			bufs[_idx] = pixBuf
-			time.Sleep(time.Millisecond * 32)
-			hoff += 0.005
+			time.Sleep(time.Millisecond * 500)
+			hoff += 0.02
 			hoff = math.Mod(hoff, 1.0)
 		}
 	}(pixBufs, &writerBufIdx)
